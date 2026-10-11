@@ -1,0 +1,100 @@
+# Profile: langchain-ai/langchain (Python uv monorepo, packages under libs/). Written 2026-10-11 (B loop).
+# Scope (decision B-LC-1): the unit-test suites of the five packages check_diff.py groups as LANGCHAIN_DIRS
+# (core, langchain [langchain_classic], langchain_v1 [langchain], text-splitters, model-profiles): every
+# core change runs all five. Partners and standard-tests are outside the traced scope: their files still
+# select in-scope tests through the import maps, but their own suites are not part of the index.
+repo: langchain-ai/langchain
+language: python
+language_confidence: read
+test_runner: pytest
+test_runner_confidence: read
+# per package, from libs/<pkg>/Makefile `make test` (CI: _test.yml runs it twice: current deps, then minimum deps)
+test_command: "cd libs/<pkg> && uv run --group test pytest -n auto --benchmark-disable --disable-socket --allow-unix-socket tests/unit_tests/"
+test_command_confidence: read
+setup:
+  os_packages: []
+  toolchain: "uv (astral-sh/setup-uv via .github/actions/uv_setup); CI Python 3.10-3.14 (core: 5 versions, others: 3.10 + 3.14); trace uses 3.12"
+  install: "cd libs/<pkg> && uv sync --group test --dev (UV_FROZEN=true; sibling packages are editable path installs)"
+  services:
+    - {image: "postgres:16", port: 5442, used_by: "libs/langchain_v1/tests/unit_tests/agents (compose-postgres.yml)"}
+    - {image: "redis", port: 6379, used_by: "libs/langchain_v1/tests/unit_tests/agents (compose-redis.yml)"}
+setup_confidence: read
+source_roots: [libs]
+test_roots:
+  - libs/core/tests/unit_tests
+  - libs/langchain/tests/unit_tests
+  - libs/langchain_v1/tests/unit_tests
+  - libs/text-splitters/tests/unit_tests
+  - libs/model-profiles/tests/unit_tests
+# each package is its own sys.path root (libs/core -> langchain_core, tests); partners likewise
+import_roots: ["libs/*", "libs/partners/*"]
+area_rules:
+  - "libs/partners/{name}/** -> libs/partners/{name}/tests/unit_tests/"
+  - "libs/{name}/** -> libs/{name}/tests/unit_tests/"
+area_rules_confidence: read
+run_everything_when:
+  # CI infrastructure: check_diff.py itself runs every LANGCHAIN_DIRS package for these (kept as-is)
+  - ".github/workflows/**"
+  - ".github/actions/**"
+  - ".github/tools/**"
+  - ".github/scripts/check_diff.py"
+  # core's declared dependencies feed every package's environment
+  - libs/core/pyproject.toml
+run_everything_when_confidence: read
+# package-level files (lockfile, Makefile, pyproject, extended deps): that package's own tests only
+tooling_scopes:
+  "libs/core/*": libs/core/tests/unit_tests/
+  "libs/langchain/*": libs/langchain/tests/unit_tests/
+  "libs/langchain_v1/*": libs/langchain_v1/tests/unit_tests/
+  "libs/text-splitters/*": libs/text-splitters/tests/unit_tests/
+  "libs/model-profiles/*": libs/model-profiles/tests/unit_tests/
+  "libs/partners/*/*": []
+  "libs/standard-tests/*": []
+  "libs/*/tests/integration_tests/**": []
+  "libs/partners/*/tests/integration_tests/**": []
+tooling_scopes_confidence: guess
+ignore:
+  - "**/*.md"
+  - LICENSE
+  - "**/LICENSE"
+  - CITATION.cff
+  - .gitignore
+  - .gitattributes
+  - .editorconfig
+  - .dockerignore
+  - .markdownlint.json
+  - .mcp.json
+  - .pre-commit-config.yaml
+  - ".devcontainer/**"
+  - ".vscode/**"
+  - ".github/ISSUE_TEMPLATE/**"
+  - ".github/images/**"
+  - .github/CODEOWNERS
+  - .github/dependabot.yml
+  - ".github/scripts/**"
+  - "openwiki/**"
+  - libs/Makefile
+  - libs/partners/Makefile
+ignore_confidence: guess
+ci:
+  provider: github_actions
+  workflow: .github/workflows/check_diffs.yml
+  test_jobs: "test (<pkg>, <py>) / Python <py> · test-pydantic (<pkg>, <pydantic>, 3.12) · Extended Tests · VCR Cassette Tests"
+  full_run_marker: "no full run exists; the broadest run is a core change (job 'test (libs/core, ...)' present -> core + 4 LANGCHAIN_DIRS dependents)"
+existing_selection: >-
+  Package-level path filtering in .github/scripts/check_diff.py: a changed file selects its package
+  (libs/<pkg>/... or libs/partners/<name>/...); dependents come from pyproject dependencies + test group
+  (`langchain*` names) and extended_testing_deps.txt, except core, whose dependents are hard-wired to the
+  LANGCHAIN_DIRS list (core -> text-splitters, langchain, langchain_v1, model-profiles; partners NOT re-run);
+  libs/standard-tests -> 5 hard-coded partners; .github/workflows|actions|tools and check_diff.py -> all
+  LANGCHAIN_DIRS; >= 300 changed files -> everything; root files run nothing. Each selected package then runs
+  its whole unit suite on 2 Python versions (core: 5), twice (current + minimum deps), plus one
+  test-pydantic job per supported pydantic minor.
+existing_selection_confidence: read
+trace:
+  coverage_core: ctrace
+  python: "3.12"
+  runner_root: /home/runner/work/langchain/langchain/
+  process_names: [python]
+  workflow: "fork Aamir-raza-1/langchain, branch trace/phase1: .github/workflows/trace-tests.yml"
+notes: "B loop 2026-10-11. Results in experiments/langchain/ (see README there)."

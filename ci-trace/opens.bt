@@ -1,0 +1,15 @@
+// Record every file opened by a python process: "<nsecs> <pid> <path>".
+// nsecs is CLOCK_MONOTONIC, matching time.monotonic_ns() in pytest_trace_plugin.py.
+// Run: sudo BPFTRACE_MAX_STRLEN=200 bpftrace script/trace/opens.bt > opens.log
+
+tracepoint:syscalls:sys_enter_openat
+/strncmp(comm, "python", 6) == 0/
+{
+  printf("%llu %d %s\n", nsecs, pid, str(args.filename));
+}
+
+tracepoint:syscalls:sys_enter_openat2
+/strncmp(comm, "python", 6) == 0/
+{
+  printf("%llu %d %s\n", nsecs, pid, str(args.filename));
+}

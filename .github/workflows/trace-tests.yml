@@ -1,0 +1,162 @@
+name: Trace tests (CI test-selection experiment)
+
+# Phase 1 of the personal ci-casestudies project (Aamir-raza-1). Runs langchain's own unit-test
+# command per package, twice per shard: baseline (untraced, for overhead + pass parity), then traced with
+#   - per-test coverage (pytest-cov --cov-context=test, COVERAGE_CORE=ctrace): Python files each test ran
+#   - eBPF file opens (bpftrace + ci-trace/opens.bt): every file each test opened
+# then builds the file -> test-files map, real seconds per test file and the static import map (Python 3.12).
+
+on:
+  workflow_dispatch:
+    inputs:
+      plan:
+        description: 'JSON {package dir: shards}'
+        default: '{"libs/core": 3, "libs/langchain": 3, "libs/langchain_v1": 2, "libs/text-splitters": 1, "libs/model-profiles": 1}'
+      python:
+        default: "3.12"
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+  UV_NO_SYNC: "true"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+      - id: split
+        env:
+          PLAN: ${{ inputs.plan }}
+        run: |
+          python3 - <<'PY'
+          import json, os, glob
+          plan = json.loads(os.environ["PLAN"])
+          inc = []
+          os.makedirs("shards", exist_ok=True)
+          for pkg, n in plan.items():
+              files = sorted(glob.glob(f"{pkg}/tests/unit_tests/**/test_*.py", recursive=True), key=lambda f: -os.path.getsize(f))
+              buckets = [[] for _ in range(n)]
+              sizes = [0] * n
+              for f in files:  # largest first into the lightest shard
+                  i = sizes.index(min(sizes)); buckets[i].append(os.path.relpath(f, pkg)); sizes[i] += os.path.getsize(f)
+              for i, b in enumerate(buckets, 1):
+                  name = pkg.replace("/", "_") + f"-{i}"
+                  open(f"shards/{name}.txt", "w").write(" ".join(sorted(b)))
+                  inc.append({"pkg": pkg, "shard": i, "name": name, "files": len(b)})
+          print(json.dumps(inc, indent=1))
+          open(os.environ["GITHUB_OUTPUT"], "a").write("matrix=" + json.dumps({"include": inc}) + "\n")
+          PY
+      - name: Static import map (target Python)
+        run: |
+          pip install -q pyyaml
+          cd ci-trace && python -m engine.static_imports .. --profile profile.yaml --out ../shards/static.json
+          cd .. && git rev-parse HEAD > shards/commit.txt && gzip -9 shards/static.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shards
+          path: shards/
+
+  trace:
+    name: Trace ${{ matrix.name }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.pkg }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/uv_setup
+        with:
+          python-version: ${{ inputs.python }}
+          cache-suffix: trace-${{ matrix.pkg }}
+          working-directory: ${{ matrix.pkg }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: shards
+          path: ${{ github.workspace }}/shards
+      - name: Install
+        run: |
+          uv sync --group test --dev
+          VIRTUAL_ENV=.venv uv pip install -q "pytest-cov>=5" "coverage>=7.6"
+          sudo apt-get update -qq && sudo apt-get install -y -qq bpftrace
+          if [ -f tests/unit_tests/agents/compose-postgres.yml ]; then make start_services; fi
+      - name: Baseline run (untraced)
+        env:
+          LANGGRAPH_TEST_FAST: "0"
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/trace"
+          echo "${{ matrix.pkg }}" > "$GITHUB_WORKSPACE/trace/pkg.txt"
+          start=$(date +%s)
+          uv run --no-sync pytest -n auto -q --benchmark-disable --disable-socket --allow-unix-socket \
+            -p no:cacheprovider --junitxml="$GITHUB_WORKSPACE/trace/junit-baseline.xml" -o junit_family=legacy \
+            $(cat "$GITHUB_WORKSPACE/shards/${{ matrix.name }}.txt") > "$GITHUB_WORKSPACE/trace/baseline.txt" 2>&1 || true
+          echo "baseline_seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_WORKSPACE/trace/timing.txt"
+          tail -3 "$GITHUB_WORKSPACE/trace/baseline.txt"
+      - name: Traced run
+        env:
+          LANGGRAPH_TEST_FAST: "0"
+          TRACE_DIR: ${{ github.workspace }}/trace
+          COVERAGE_CORE: ctrace
+          PYTHONPATH: ${{ github.workspace }}/ci-trace
+        run: |
+          sudo BPFTRACE_MAX_STRLEN=200 bpftrace "$GITHUB_WORKSPACE/ci-trace/opens.bt" > "$TRACE_DIR/opens.log" 2> "$TRACE_DIR/bpftrace.err" &
+          for i in $(seq 1 60); do grep -q "Attaching" "$TRACE_DIR/bpftrace.err" 2>/dev/null && break; sleep 1; done
+          cat "$TRACE_DIR/bpftrace.err"
+          start=$(date +%s)
+          uv run --no-sync pytest -n auto -q --benchmark-disable --disable-socket --allow-unix-socket \
+            -p no:cacheprovider --cov="$GITHUB_WORKSPACE/libs" --cov-context=test --cov-report= \
+            -p pytest_trace_plugin --junitxml="$TRACE_DIR/junit.xml" -o junit_family=legacy \
+            $(cat "$GITHUB_WORKSPACE/shards/${{ matrix.name }}.txt") > "$TRACE_DIR/traced.txt" 2>&1 || true
+          echo "traced_seconds=$(( $(date +%s) - start ))" | tee -a "$TRACE_DIR/timing.txt"
+          sudo pkill -INT bpftrace || true
+          sleep 3
+          tail -3 "$TRACE_DIR/traced.txt"
+          mv .coverage "$TRACE_DIR/coverage.sqlite"
+          git rev-parse HEAD > "$TRACE_DIR/commit.txt"
+          gzip -9 "$TRACE_DIR/opens.log"
+          ls -la "$TRACE_DIR"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trace-group-${{ matrix.name }}
+          path: trace/
+          retention-days: 30
+
+  analyze:
+    needs: trace
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: trace-group-*
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: shards
+          path: out
+      - run: |
+          python3 ci-trace/analyze.py artifacts --root "$GITHUB_WORKSPACE/" --out out --no-test-map
+          for g in artifacts/trace-group-*; do n=$(basename $g); echo "$n $(cat $g/timing.txt 2>/dev/null | tr '\n' ' ') | base: $(tail -1 $g/baseline.txt 2>/dev/null) | traced: $(tail -1 $g/traced.txt 2>/dev/null)"; done | tee out/groups.txt
+          mkdir -p out/junit && for g in artifacts/trace-group-*; do n=$(basename $g); cp $g/junit-baseline.xml out/junit/$n-baseline.xml 2>/dev/null; cp $g/junit.xml out/junit/$n-traced.xml 2>/dev/null; cp $g/pkg.txt out/junit/$n.pkg 2>/dev/null; done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: analysis
+          path: out/
