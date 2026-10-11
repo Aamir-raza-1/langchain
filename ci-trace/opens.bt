@@ -13,3 +13,11 @@ tracepoint:syscalls:sys_enter_openat2
 {
   printf("%llu %d %s\n", nsecs, pid, str(args.filename));
 }
+
+// chdir per process, so relative opens can be resolved against the right directory
+// (tests that os.chdir() into a data folder and open relative paths). Line: "<nsecs> <pid> CHDIR <path>".
+tracepoint:syscalls:sys_enter_chdir
+/strncmp(comm, "python", 6) == 0/
+{
+  printf("%llu %d CHDIR %s\n", nsecs, pid, str(args.filename));
+}

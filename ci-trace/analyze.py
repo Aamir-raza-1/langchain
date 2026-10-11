@@ -83,12 +83,23 @@ def ebpf_deps(group_dir, windows, roots, prefix=""):
         return deps, 0, 0
     starts = {pid: [w[0] for w in ws] for pid, ws in windows.items()}
     seen = attributed = 0
+    cwd = {}  # pid -> absolute cwd after the last chdir (opens.bt CHDIR lines); default: the package dir
+    base = roots[0].rstrip("/") + "/" + prefix if roots else ""
+    events = []
     with gzip.open(path, "rt", errors="replace") as fh:
         for line in fh:
             parts = line.rstrip("\n").split(" ", 2)
-            if len(parts) != 3 or not parts[0].isdigit():
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                events.append((int(parts[0]), int(parts[1]), parts[2]))
+    events.sort()  # per-CPU buffers can interleave; chdir must precede the opens it affects
+    if True:
+        for ns, pid, fpath in events:
+            if fpath.startswith("CHDIR "):
+                d = fpath[6:]
+                cwd[pid] = os.path.normpath(d if d.startswith("/") else os.path.join(cwd.get(pid, base), d))
                 continue
-            ns, pid, fpath = int(parts[0]), int(parts[1]), parts[2]
+            if not fpath.startswith("/") and pid in cwd:
+                fpath = os.path.normpath(os.path.join(cwd[pid], fpath))
             seen += 1
             ws = windows.get(pid)
             if not ws:

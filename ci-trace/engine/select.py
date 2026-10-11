@@ -13,7 +13,7 @@ Rules, first match wins per changed file (profile field in brackets):
     test file                             -> itself
     other source file (helpers)           -> test files importing it + its folder's tests
     data file                             -> its folder's tests (runner data dirs such as fixtures/ cut off)
-                                             + tests that opened it at runtime
+                                             + tests that opened it at runtime; neither -> its area's tests
   under source_roots:
     module in the import graph            -> body-only edit with a runtime map: runtime users + area tests
                                              otherwise: static importers (+ runtime users: dynamic loading)
@@ -183,7 +183,12 @@ def select(files, kinds, rules, idx):
             else:
                 for dd in run["data_dirs"]:
                     d = d.split("/" + dd)[0]
-                selected |= idx.folder(d + "/") | idx.used_at_runtime(f)  # + tests that opened it (traced run)
+                found = idx.folder(d + "/") | idx.used_at_runtime(f)  # + tests that opened it (traced run)
+                if not found:  # nobody visibly reads it (e.g. read at collection time): the area's tests
+                    area = rules.area.name(f)
+                    found = idx.folder(rules.area.tests_dir(area)) if area else set()
+                    reasons["data file, no reader seen: area"] += 1
+                selected |= found
             reasons["tests"] += 1
         elif f.startswith(rules.source_roots):
             area = rules.area.name(f)
