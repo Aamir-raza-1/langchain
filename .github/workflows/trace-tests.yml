@@ -91,7 +91,6 @@ jobs:
           uv sync --group test --dev
           VIRTUAL_ENV=.venv uv pip install -q "pytest-cov>=5" "coverage>=7.6"
           sudo apt-get update -qq && sudo apt-get install -y -qq bpftrace
-          if [ -f tests/unit_tests/agents/compose-postgres.yml ]; then make start_services; fi
       - name: Baseline run (untraced)
         env:
           LANGGRAPH_TEST_FAST: "0"
@@ -99,9 +98,10 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/trace"
           echo "${{ matrix.pkg }}" > "$GITHUB_WORKSPACE/trace/pkg.txt"
           start=$(date +%s)
-          uv run --no-sync pytest -n auto -q --benchmark-disable --disable-socket --allow-unix-socket \
-            -p no:cacheprovider --junitxml="$GITHUB_WORKSPACE/trace/junit-baseline.xml" -o junit_family=legacy \
-            $(cat "$GITHUB_WORKSPACE/shards/${{ matrix.name }}.txt") > "$GITHUB_WORKSPACE/trace/baseline.txt" 2>&1 || true
+          # the package's own `make test` (CI: _test.yml), restricted to this shard's files
+          make test TEST_FILE="$(cat "$GITHUB_WORKSPACE/shards/${{ matrix.name }}.txt")" \
+            PYTEST_EXTRA="-q -p no:cacheprovider --junitxml=$GITHUB_WORKSPACE/trace/junit-baseline.xml -o junit_family=legacy" \
+            > "$GITHUB_WORKSPACE/trace/baseline.txt" 2>&1 || true
           echo "baseline_seconds=$(( $(date +%s) - start ))" | tee -a "$GITHUB_WORKSPACE/trace/timing.txt"
           tail -3 "$GITHUB_WORKSPACE/trace/baseline.txt"
       - name: Traced run
@@ -115,15 +115,14 @@ jobs:
           for i in $(seq 1 60); do grep -q "Attaching" "$TRACE_DIR/bpftrace.err" 2>/dev/null && break; sleep 1; done
           cat "$TRACE_DIR/bpftrace.err"
           start=$(date +%s)
-          uv run --no-sync pytest -n auto -q --benchmark-disable --disable-socket --allow-unix-socket \
-            -p no:cacheprovider --cov="$GITHUB_WORKSPACE/libs" --cov-context=test --cov-report= \
-            -p pytest_trace_plugin --junitxml="$TRACE_DIR/junit.xml" -o junit_family=legacy \
-            $(cat "$GITHUB_WORKSPACE/shards/${{ matrix.name }}.txt") > "$TRACE_DIR/traced.txt" 2>&1 || true
+          make test TEST_FILE="$(cat "$GITHUB_WORKSPACE/shards/${{ matrix.name }}.txt")" \
+            PYTEST_EXTRA="-q -p no:cacheprovider --cov=$GITHUB_WORKSPACE/libs --cov-context=test --cov-report= -p pytest_trace_plugin --junitxml=$TRACE_DIR/junit.xml -o junit_family=legacy" \
+            > "$TRACE_DIR/traced.txt" 2>&1 || true
           echo "traced_seconds=$(( $(date +%s) - start ))" | tee -a "$TRACE_DIR/timing.txt"
           sudo pkill -INT bpftrace || true
           sleep 3
           tail -3 "$TRACE_DIR/traced.txt"
-          mv .coverage "$TRACE_DIR/coverage.sqlite"
+          if [ -f .coverage ]; then mv .coverage "$TRACE_DIR/coverage.sqlite"; else echo "::error::no .coverage produced"; tail -30 "$TRACE_DIR/traced.txt"; exit 1; fi
           git rev-parse HEAD > "$TRACE_DIR/commit.txt"
           gzip -9 "$TRACE_DIR/opens.log"
           ls -la "$TRACE_DIR"
@@ -154,7 +153,7 @@ jobs:
       - run: |
           python3 ci-trace/analyze.py artifacts --root "$GITHUB_WORKSPACE/" --out out --no-test-map
           for g in artifacts/trace-group-*; do n=$(basename $g); echo "$n $(cat $g/timing.txt 2>/dev/null | tr '\n' ' ') | base: $(tail -1 $g/baseline.txt 2>/dev/null) | traced: $(tail -1 $g/traced.txt 2>/dev/null)"; done | tee out/groups.txt
-          mkdir -p out/junit && for g in artifacts/trace-group-*; do n=$(basename $g); cp $g/junit-baseline.xml out/junit/$n-baseline.xml 2>/dev/null; cp $g/junit.xml out/junit/$n-traced.xml 2>/dev/null; cp $g/pkg.txt out/junit/$n.pkg 2>/dev/null; done
+          mkdir -p out/junit && for g in artifacts/trace-group-*; do n=$(basename $g); cp $g/junit-baseline.xml out/junit/$n-baseline.xml || true; cp $g/junit.xml out/junit/$n-traced.xml || true; cp $g/pkg.txt out/junit/$n.pkg || true; done
           ls -la out
       - uses: actions/upload-artifact@v4
         with:
