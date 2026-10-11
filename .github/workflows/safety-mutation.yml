@@ -1,0 +1,91 @@
+name: Safety check (mutation)
+
+# Safety check for the personal ci-casestudies project: plants one small bug per batch in an in-scope
+# source file (lines the traced run executed), runs EVERY in-scope package's unit suite per batch,
+# and uploads junit (repo-relative file paths) for `engine verify` (selection must hold every failing test file).
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        default: "1"
+      packages:
+        default: "libs/core libs/langchain libs/langchain_v1 libs/text-splitters libs/model-profiles"
+      python:
+        default: "3.12"
+      max_batches:
+        default: "60"
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "true"
+  UV_NO_SYNC: "true"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      batches: ${{ steps.gen.outputs.batches }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+      - id: gen
+        env:
+          SEED: ${{ inputs.seed }}
+          MAXB: ${{ inputs.max_batches }}
+        run: |
+          python ci-trace/mutate.py generate ci-trace/mutation_targets.json --seed "$SEED" --out mutation --executed ci-trace/executed_lines.json
+          python3 -c "import json,os; b=json.load(open('mutation/batches.json')); n=min(len(b), int(os.environ['MAXB'])+1); json.dump(b[:n], open('mutation/batches.json','w')); print('batches', n)"
+          echo "batches=$(python3 -c "import json; print(json.dumps(list(range(len(json.load(open('mutation/batches.json')))))))")" >> "$GITHUB_OUTPUT"
+          cat mutation/batches.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutation
+          path: mutation/
+
+  run:
+    name: Batch ${{ matrix.batch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: ${{ fromJson(needs.prepare.outputs.batches) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.21"
+          python-version: ${{ inputs.python }}
+          enable-cache: true
+          cache-dependency-glob: "libs/**/uv.lock"
+          cache-suffix: safety
+      - uses: actions/download-artifact@v4
+        with:
+          name: mutation
+          path: mutation
+      - name: Apply mutant(s) and run every in-scope package
+        env:
+          PACKAGES: ${{ inputs.packages }}
+          B: ${{ matrix.batch }}
+          LANGGRAPH_TEST_FAST: "0"
+        run: |
+          python3 ci-trace/mutate.py apply mutation "$B"
+          mkdir -p junit
+          for pkg in $PACKAGES; do
+            g=$(echo "$pkg" | tr '/' '_')
+            ( cd "$pkg" && uv sync -q --group test --dev && \
+              timeout 1500 make test PYTEST_EXTRA="-q -p no:cacheprovider --junitxml=$GITHUB_WORKSPACE/junit/junit-b${B}-g${g}.xml -o junit_family=legacy" > "$GITHUB_WORKSPACE/junit/out-${g}.txt" 2>&1 ) || true
+            if [ -f "junit/junit-b${B}-g${g}.xml" ]; then python3 ci-trace/junit_prefix.py "junit/junit-b${B}-g${g}.xml" "$pkg"; else echo "::error::no junit for $pkg (batch $B)"; tail -20 "junit/out-${g}.txt"; fi
+            echo "$pkg: $(tail -1 junit/out-${g}.txt)"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-b${{ matrix.batch }}
+          path: junit/

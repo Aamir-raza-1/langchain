@@ -36,10 +36,12 @@ def repo_relative(path, roots):
     return None
 
 
-def normalize(path, roots):
-    """Return ('repo', relpath) | ('pkg', distribution-ish name) | None for noise."""
+def normalize(path, roots, prefix=""):
+    """Return ('repo', relpath) | ('pkg', distribution-ish name) | None for noise.
+    Relative paths are relative to the process cwd: the package dir (prefix) in a monorepo."""
     if not path.startswith("/"):
-        return ("repo", os.path.normpath(path))
+        rel = os.path.normpath(prefix + path)
+        return None if rel in (".", prefix.rstrip("/")) else ("repo", rel)
     rel = repo_relative(path, roots)
     if rel is not None:
         if os.path.basename(rel).startswith((".coverage", "junit")):
@@ -74,7 +76,7 @@ def load_windows(group_dir):
     return windows
 
 
-def ebpf_deps(group_dir, windows, roots):
+def ebpf_deps(group_dir, windows, roots, prefix=""):
     deps = collections.defaultdict(set)
     path = os.path.join(group_dir, "opens.log.gz")
     if not os.path.exists(path):
@@ -94,7 +96,7 @@ def ebpf_deps(group_dir, windows, roots):
             i = bisect.bisect_right(starts[pid], ns) - 1
             if i < 0 or ns > ws[i][1]:
                 continue
-            norm = normalize(fpath, roots)
+            norm = normalize(fpath, roots, prefix)
             if norm:
                 attributed += 1
                 deps[ws[i][2]].add(norm)
@@ -143,7 +145,7 @@ def main():
             for _, _, nodeid, outcome in ws:
                 tests[nodeid] = outcome
         c, unattr = coverage_deps(gdir, roots, prefix_of(gdir))
-        e, seen, attr = ebpf_deps(gdir, windows, roots)
+        e, seen, attr = ebpf_deps(gdir, windows, roots, prefix_of(gdir))
         opens_seen += seen
         opens_attr += attr
         import_time_only |= unattr

@@ -1,0 +1,70 @@
+name: Isolate mutants (re-run failures with one mutant alone)
+
+# Applies ONE mutant at a time (0 = none) and re-runs the given test files N times, to confirm which
+# planted bug made a test file fail and whether it is flaky (personal ci-casestudies project).
+
+on:
+  workflow_dispatch:
+    inputs:
+      mutation_run_id:
+        description: Run ID of the safety-mutation run (for its mutants.json)
+        required: true
+      plan:
+        description: 'JSON [{"mutant": <id, 0 = none>, "pkg": "libs/x", "tests": "tests/unit_tests/a.py ..."}]'
+        required: true
+      repeats:
+        default: "3"
+      python:
+        default: "3.12"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  UV_FROZEN: "true"
+  UV_NO_SYNC: "true"
+
+jobs:
+  run:
+    name: Mutant ${{ matrix.item.mutant }} ${{ matrix.item.pkg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJson(inputs.plan) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.21"
+          python-version: ${{ inputs.python }}
+          enable-cache: true
+          cache-dependency-glob: "libs/**/uv.lock"
+          cache-suffix: safety
+      - uses: actions/download-artifact@v4
+        with:
+          name: mutation
+          path: mutation
+          run-id: ${{ inputs.mutation_run_id }}
+          github-token: ${{ github.token }}
+      - name: Apply mutant and run the tests N times
+        env:
+          M: ${{ matrix.item.mutant }}
+          PKG: ${{ matrix.item.pkg }}
+          TESTS: ${{ matrix.item.tests }}
+          REPEATS: ${{ inputs.repeats }}
+          LANGGRAPH_TEST_FAST: "0"
+        run: |
+          if [ "$M" != "0" ]; then python3 ci-trace/mutate.py apply-ids mutation "$M"; fi
+          mkdir -p out
+          cd "$PKG" && uv sync -q --group test --dev
+          for i in $(seq 1 "$REPEATS"); do
+            make test TEST_FILE="$TESTS" PYTEST_EXTRA="-q -p no:cacheprovider --junitxml=$GITHUB_WORKSPACE/out/junit-m${M}-r${i}.xml -o junit_family=legacy" > "$GITHUB_WORKSPACE/out/run-$i.txt" 2>&1 || true
+            python3 "$GITHUB_WORKSPACE/ci-trace/junit_prefix.py" "$GITHUB_WORKSPACE/out/junit-m${M}-r${i}.xml" "$PKG" || echo "::error::no junit (repeat $i)"
+            echo "repeat $i: $(grep -E 'passed|failed' $GITHUB_WORKSPACE/out/run-$i.txt | tail -1)"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isolate-m${{ matrix.item.mutant }}-${{ strategy.job-index }}
+          path: out/*.xml
