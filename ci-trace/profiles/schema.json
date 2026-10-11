@@ -1,0 +1,32 @@
+{
+  "_doc": "Per-repo profile: everything repo-specific the engine needs. Engine code stays generic. Types: str, list, dict, bool. 'required' fields must be present; each top-level field may have a sibling '<field>_confidence': read|guess. A10: dependency_lockfiles = aggregate lockfiles whose change only affects the areas whose dependency manifest changed in the same PR (no manifest changed -> full). tooling_scopes values may be a string or a list of test folders. M5 (2026-10-11): area_rules = several area rules, first match wins (monorepos: one per workspace group); always_run = test globs added to every non-full selection (tests whose inputs neither map sees, e.g. they read repo files from disk). B (langchain, 2026-10-11): import_roots = dirs on sys.path (monorepo packages, `*` segments expanded); static import names are relative to them and resolve in the importing file's own package first.",
+  "required": {
+    "repo": "str",
+    "language": "str",
+    "test_runner": "str",
+    "test_command": "str",
+    "setup": "dict",
+    "source_roots": "list",
+    "test_roots": "list",
+    "run_everything_when": "list",
+    "ci": "dict",
+    "existing_selection": "str"
+  },
+  "optional": {
+    "area_rule": "str",
+    "import_roots": "list",
+    "area_rules": "list",
+    "always_run": "list",
+    "dependency_manifests": "list",
+    "dependency_lockfiles": "list",
+    "tooling_scopes": "dict",
+    "generated_files": "list",
+    "ignore": "list",
+    "trace": "dict",
+    "notes": "str"
+  },
+  "enums": {
+    "language": ["python", "typescript", "javascript", "java", "kotlin", "go", "rust", "ruby", "csharp", "cpp", "other"],
+    "ci.provider": ["github_actions", "gitlab_ci", "buildkite", "azure_pipelines", "jenkins", "circleci", "other"]
+  }
+}
