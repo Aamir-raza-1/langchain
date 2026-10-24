@@ -1,70 +1,172 @@
-name: Isolate mutants (re-run failures with one mutant alone)
-
-# Applies ONE mutant at a time (0 = none) and re-runs the given test files N times, to confirm which
-# planted bug made a test file fail and whether it is flaky (personal ci-casestudies project).
+name: Revalidate 5x scenarios (DV8)
 
 on:
+  push:
+    branches:
+      - reval/5x
   workflow_dispatch:
-    inputs:
-      mutation_run_id:
-        description: Run ID of the safety-mutation run (for its mutants.json)
-        required: true
-      plan:
-        description: 'JSON [{"mutant": <id, 0 = none>, "pkg": "libs/x", "tests": "tests/unit_tests/a.py ..."}]'
-        required: true
-      repeats:
-        default: "3"
-      python:
-        default: "3.12"
 
 permissions:
   contents: read
-  actions: read
 
 env:
   UV_FROZEN: "true"
   UV_NO_SYNC: "true"
 
 jobs:
-  run:
-    name: Mutant ${{ matrix.item.mutant }} ${{ matrix.item.pkg }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        item: ${{ fromJson(inputs.plan) }}
+  langchain:
+    name: Revalidate 5 scenarios (langchain)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.21"
-          python-version: ${{ inputs.python }}
+          python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: "libs/**/uv.lock"
           cache-suffix: safety
-      - uses: actions/download-artifact@v4
-        with:
-          name: mutation
-          path: mutation
-          run-id: ${{ inputs.mutation_run_id }}
-          github-token: ${{ github.token }}
-      - name: Apply mutant and run the tests N times
-        env:
-          M: ${{ matrix.item.mutant }}
-          PKG: ${{ matrix.item.pkg }}
-          TESTS: ${{ matrix.item.tests }}
-          REPEATS: ${{ inputs.repeats }}
-          LANGGRAPH_TEST_FAST: "0"
+      - name: Run 5 scenarios on langchain (libs/model-profiles + libs/core)
         run: |
-          if [ "$M" != "0" ]; then python3 ci-trace/mutate.py apply-ids mutation "$M"; fi
           mkdir -p out
-          cd "$PKG" && uv sync -q --group test --dev
-          for i in $(seq 1 "$REPEATS"); do
-            make test TEST_FILE="$TESTS" PYTEST_EXTRA="-q -p no:cacheprovider --junitxml=$GITHUB_WORKSPACE/out/junit-m${M}-r${i}.xml -o junit_family=legacy" > "$GITHUB_WORKSPACE/out/run-$i.txt" 2>&1 || true
-            python3 "$GITHUB_WORKSPACE/ci-trace/junit_prefix.py" "$GITHUB_WORKSPACE/out/junit-m${M}-r${i}.xml" "$PKG" || echo "::error::no junit (repeat $i)"
-            echo "repeat $i: $(grep -E 'passed|failed' $GITHUB_WORKSPACE/out/run-$i.txt | tail -1)"
-          done
+          cd libs/model-profiles && uv sync -q --group test --dev
+          # Scenario 1: leaf component (libs/model-profiles/langchain_model_profiles/cli.py -> 2 test files)
+          t0=$(python3 -c 'import time; print(time.time())')
+          uv run --no-sync pytest -p no:cacheprovider -q --junitxml="$GITHUB_WORKSPACE/out/s1.xml" -o junit_family=legacy \
+            tests/unit_tests/test_cli.py tests/unit_tests/test_summary.py > "$GITHUB_WORKSPACE/out/s1.txt" 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "S1_leaf sec=$(python3 -c "print(round($t1-$t0, 2))") $(tail -1 "$GITHUB_WORKSPACE/out/s1.txt")"
+
+          # Scenario 4: test-only (libs/model-profiles/tests/unit_tests/test_cli.py -> 1 test file)
+          t0=$(python3 -c 'import time; print(time.time())')
+          uv run --no-sync pytest -p no:cacheprovider -q --junitxml="$GITHUB_WORKSPACE/out/s4.xml" -o junit_family=legacy \
+            tests/unit_tests/test_cli.py > "$GITHUB_WORKSPACE/out/s4.txt" 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "S4_test_only sec=$(python3 -c "print(round($t1-$t0, 2))") $(tail -1 "$GITHUB_WORKSPACE/out/s4.txt")"
+
+          # Scenario 5: planted bug in libs/model-profiles/langchain_model_profiles/cli.py line 199 (negate-if)
+          python3 -c '
+          p = "langchain_model_profiles/cli.py"
+          txt = open(p).read()
+          target = "if output_file.exists() and output_file.is_symlink():"
+          assert target in txt
+          open(p, "w").write(txt.replace(target, "if not (output_file.exists() and output_file.is_symlink()):", 1))
+          '
+          t0=$(python3 -c 'import time; print(time.time())')
+          set +e
+          uv run --no-sync pytest -p no:cacheprovider -q --junitxml="$GITHUB_WORKSPACE/out/s5_selected.xml" -o junit_family=legacy \
+            tests/unit_tests/test_cli.py tests/unit_tests/test_summary.py > "$GITHUB_WORKSPACE/out/s5_selected.txt" 2>&1
+          rc_sel=$?
+          set -e
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "S5_planted_bug_selected rc=$rc_sel sec=$(python3 -c "print(round($t1-$t0, 2))") $(tail -1 "$GITHUB_WORKSPACE/out/s5_selected.txt")"
+          git checkout -- langchain_model_profiles/cli.py
       - uses: actions/upload-artifact@v4
         with:
-          name: isolate-m${{ matrix.item.mutant }}-${{ strategy.job-index }}
-          path: out/*.xml
+          name: reval-5x-langchain
+          path: out/
+
+  k8s:
+    name: Revalidate 5 scenarios (kubernetes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - name: Shallow fetch kubernetes/kubernetes at map commit and run 5 scenarios
+        run: |
+          mkdir -p /tmp/k8s out
+          git -C /tmp/k8s init -q
+          git -C /tmp/k8s remote add origin https://github.com/kubernetes/kubernetes.git
+          git -C /tmp/k8s fetch -q --depth 1 origin c10f2d14e6dd9efd5fa2c2ade3f9f6cef7ffd2ca
+          git -C /tmp/k8s checkout -q FETCH_HEAD
+          cd /tmp/k8s
+
+          # Scenario 1 & 4: leaf / test-only (pkg/util/env -> 1 package)
+          t0=$(python3 -c 'import time; print(time.time())')
+          go test -count=1 ./pkg/util/env > "$GITHUB_WORKSPACE/out/k8s_s1.txt" 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "K8S_S1_S4 sec=$(python3 -c "print(round($t1-$t0, 2))") $(cat "$GITHUB_WORKSPACE/out/k8s_s1.txt")"
+
+          # Scenario 5: planted bug in pkg/util/env/env.go line 30 (return defaultValue -> return "")
+          python3 -c '
+          p = "pkg/util/env/env.go"
+          txt = open(p).read()
+          assert "\treturn defaultValue\n" in txt
+          open(p, "w").write(txt.replace("\treturn defaultValue\n", "\treturn \"\"\n", 1))
+          '
+          t0=$(python3 -c 'import time; print(time.time())')
+          set +e
+          go test -count=1 ./pkg/util/env > "$GITHUB_WORKSPACE/out/k8s_s5_selected.txt" 2>&1
+          rc_sel=$?
+          go test -count=1 ./pkg/kubelet/cm/devicemanager > "$GITHUB_WORKSPACE/out/k8s_s5_other_importer.txt" 2>&1
+          rc_other=$?
+          set -e
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "K8S_S5 rc_sel=$rc_sel rc_other=$rc_other sec=$(python3 -c "print(round($t1-$t0, 2))")"
+          cat "$GITHUB_WORKSPACE/out/k8s_s5_selected.txt"
+          cat "$GITHUB_WORKSPACE/out/k8s_s5_other_importer.txt"
+          git checkout -- pkg/util/env/env.go
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reval-5x-k8s
+          path: out/
+
+  supabase:
+    name: Revalidate 5 scenarios (supabase)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Sparse checkout supabase/supabase at map commit and run scenarios
+        run: |
+          mkdir -p /tmp/supa out
+          git -C /tmp/supa init -q
+          git -C /tmp/supa remote add origin https://github.com/supabase/supabase.git
+          git -C /tmp/supa sparse-checkout init --cone
+          git -C /tmp/supa sparse-checkout set apps/studio packages
+          git -C /tmp/supa fetch -q --depth 1 origin 7e866ef83e89e35cdda45a6c98abd069d5fa1b2f
+          git -C /tmp/supa checkout -q FETCH_HEAD
+          cd /tmp/supa
+          pnpm install --frozen-lockfile
+          cd apps/studio
+
+          # Scenario 1: leaf component (apps/studio/compat/next/router.ts -> 4 test files)
+          t0=$(python3 -c 'import time; print(time.time())')
+          pnpm exec vitest run compat/next/api.test.ts compat/next/router-navigation.test.tsx compat/next/router.test.ts compat/next/router.tsx.test.tsx > "$GITHUB_WORKSPACE/out/supa_s1.txt" 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "SUPA_S1 sec=$(python3 -c "print(round($t1-$t0, 2))")"
+          tail -10 "$GITHUB_WORKSPACE/out/supa_s1.txt"
+
+          # Scenario 4: test-only (apps/studio/compat/next/router.test.ts -> 1 test file)
+          t0=$(python3 -c 'import time; print(time.time())')
+          pnpm exec vitest run compat/next/router.test.ts > "$GITHUB_WORKSPACE/out/supa_s4.txt" 2>&1
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "SUPA_S4 sec=$(python3 -c "print(round($t1-$t0, 2))")"
+          tail -10 "$GITHUB_WORKSPACE/out/supa_s4.txt"
+
+          # Scenario 5: planted bug in apps/studio/compat/next/router.ts line 36
+          python3 -c '
+          p = "compat/next/router.ts"
+          txt = open(p).read()
+          target = "return withBracketParams.replace(/\\/$/, '\'''\'')"
+          assert target in txt
+          open(p, "w").write(txt.replace(target, "return '\'''\''", 1))
+          '
+          t0=$(python3 -c 'import time; print(time.time())')
+          set +e
+          pnpm exec vitest run compat/next/api.test.ts compat/next/router-navigation.test.tsx compat/next/router.test.ts compat/next/router.tsx.test.tsx > "$GITHUB_WORKSPACE/out/supa_s5_selected.txt" 2>&1
+          rc_sel=$?
+          set -e
+          t1=$(python3 -c 'import time; print(time.time())')
+          echo "SUPA_S5 rc_sel=$rc_sel sec=$(python3 -c "print(round($t1-$t0, 2))")"
+          tail -20 "$GITHUB_WORKSPACE/out/supa_s5_selected.txt"
+          git checkout -- compat/next/router.ts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reval-5x-supabase
+          path: out/
